@@ -101,7 +101,8 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
 
     pad_token_id: int
     return_tensors: str = "pt"
-
+    cp_rank: Optional[int] = None # context parallel rank
+    cp_size: Optional[int] = None # context parallel size
     def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
         # Convert to tensor
         input_ids = [torch.tensor(example["input_ids"]) for example in examples]
@@ -113,6 +114,15 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
         output["input_ids"] = pad(input_ids, padding_value=self.pad_token_id, padding_side="right")
         output["attention_mask"] = pad(attention_mask, padding_value=0, padding_side="right")
         output["labels"] = pad(labels, padding_value=-100, padding_side="right")
+
+        if self.cp_rank is not None:
+            # We slice the output to get the correct context parallel rank
+            sequence_length = output["input_ids"].shape[1]
+            assert sequence_length % self.cp_size == 0, "Sequence length must be divisible by context parallel size"
+            local_sequence = slice(self.cp_rank * sequence_length // self.cp_size, (self.cp_rank + 1) * sequence_length // self.cp_size)
+            output["input_ids"] = output["input_ids"][:, local_sequence]
+            output["attention_mask"] = output["attention_mask"][:, local_sequence]
+            output["labels"] = output["labels"][:, local_sequence]
 
         return output
 
@@ -252,6 +262,9 @@ class SFTTrainer(Trainer):
         if peft_config is not None:
             model = self._prepare_peft_model(model, peft_config, args)
 
+        # Context Parallelism / Nanotron Plugin
+        from accelerate.utils import NanotronPlugin
+        args.nanotron_plugin = NanotronPlugin(cp_size=2)
         # Data collator
         if args.padding_free:
             if data_collator is not None:
@@ -289,7 +302,9 @@ class SFTTrainer(Trainer):
                     f"`processing_class` ({processing_class.__class__.__name__}). Ensure that the `pad_token` exists "
                     "in the vocabulary before using it as a padding token."
                 )
-            data_collator = DataCollatorForLanguageModeling(pad_token_id)
+            data_collator = DataCollatorForLanguageModeling(
+                pad_token_id, cp_size=args.nanotron_plugin.cp_size, cp_rank=args.nanotron_plugin.cp_rank
+            )
 
         # Dataset
         preprocess_dataset = args.dataset_kwargs is None or not args.dataset_kwargs.get("skip_prepare_dataset", False)
@@ -329,6 +344,7 @@ class SFTTrainer(Trainer):
                     "The default optimizer will be used. "
                     "Remove the `optimizer_cls_and_kwargs` or upgrade to `transformers>=4.47.0`."
                 )
+
         super().__init__(
             model=model,
             args=args,
